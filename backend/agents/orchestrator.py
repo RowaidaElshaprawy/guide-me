@@ -1,3 +1,4 @@
+# backend/agents/orchestrator.py
 from backend.core.schemas import (
     ChatRequest, ChatResponse, PipelineStage,
     HydrationRequest, LivePriceData
@@ -5,7 +6,7 @@ from backend.core.schemas import (
 from backend.core.config import Settings
 from backend.agents.gemini_searcher import GeminiSearcher
 from backend.agents.data_cleaner import DataCleaner
-from backend.agents.reviewer import Reviewer
+from backend.agents.reviewer import ReviewerAgent
 from backend.scrapers.scrapling_engine import ScraplingEngine
 
 
@@ -30,7 +31,7 @@ class Orchestrator:
         self.settings = settings
         self.searcher = GeminiSearcher()
         self.cleaner = DataCleaner()
-        self.reviewer = Reviewer()
+        self.reviewer = ReviewerAgent()
         self.scraper = ScraplingEngine()
 
     async def run(self, request: ChatRequest) -> ChatResponse:
@@ -94,10 +95,21 @@ class Orchestrator:
                 request.conversation_history,
             )
 
-            # Handle distance query if requested
+            # FIX: Ensure intent context is reliably handled as a dictionary wrapper
+            if hasattr(intent, "model_dump"):
+                intent_dict = intent.model_dump()
+            elif hasattr(intent, "__dict__"):
+                intent_dict = intent.__dict__
+            elif isinstance(intent, dict):
+                intent_dict = intent
+            else:
+                intent_dict = {}
+
+            # Handle distance query if requested safely
             distance_info = None
-            dist_query = intent.get("distance_query", {})
-            if dist_query.get("origin") and dist_query.get("destination"):
+            dist_query = intent_dict.get("distance_query", {}) or {}
+            
+            if isinstance(dist_query, dict) and dist_query.get("origin") and dist_query.get("destination"):
                 origin_geo = await self.searcher.geocode_location(dist_query["origin"])
                 dest_geo = await self.searcher.geocode_location(dist_query["destination"])
 
@@ -111,11 +123,12 @@ class Orchestrator:
                         dest_name=dist_query["destination"],
                     )
 
+            # Fire off batch checking rules aligned with our updated ReviewerAgent implementation
             verified_properties, summary_message = await self.reviewer.review(
                 properties=search_result.properties,
                 live_prices=live_prices,
                 user_message=request.user_message,
-                max_budget_usd=intent.get("max_budget_usd"),
+                max_budget_usd=intent_dict.get("max_budget_usd"),
                 distance_info=distance_info,
             )
 

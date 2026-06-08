@@ -1,184 +1,167 @@
-import ollama
+# backend/agents/reviewer.py
 import json
-import re
+import logging
+from datetime import datetime, timezone
+from google import genai
+from google.genai import types
+
 from backend.core.config import settings
-from backend.core.schemas import (
-    PropertyRecord, LivePriceData, VerifiedProperty,
-    PropertyType, DistanceResult
-)
+from backend.core.schemas import AgentReviewRequest, ValidationResult, LivePriceData
 
+logger = logging.getLogger(__name__)
 
-class Reviewer:
+class ReviewerAgent:
     """
-    Agent 3 — The Quality Controller and Synthesizer.
-
-    RECEIVES: Static property records + live price data + user constraints
-    PRODUCES: Final verified list with reviewer notes + narrative response
-
-    TWO JOBS:
-    1. FILTER: Drop properties that violate user constraints (over budget, wrong type, unavailable)
-    2. SYNTHESIZE: Write a natural conversational response summarizing what was found
-
-    WHY LOCAL MODEL FOR THIS:
-    Filtering is rule-based logic. Synthesis is short-form writing.
-    Both are well within Phi-3 Mini's capability with zero API cost.
+    Agent 3: Final Validator Gatekeeper. Evaluates combined static DB and 
+    live dynamic payloads against explicit user preference filters.
+    Utilizes Gemini via the modern google-genai SDK.
     """
-
     def __init__(self):
-        self.model = settings.ollama_reviewer_model
+        # Initializes the standard modern GenAI client matching settings keys
+        self.client = genai.Client(api_key=settings.gemini_api_key)
+        self.model = "gemini-2.5-flash"
 
-    def _merge_property_data(
-        self,
-        record: PropertyRecord,
-        live_data: LivePriceData | None,
-        distance_info: DistanceResult | None,
-    ) -> dict:
-        """Merges static and live data into a single dict for the reviewer prompt."""
-        return {
-            "property_id": record.property_id,
-            "name": record.name,
-            "type": record.property_type.value,
-            "city": record.city,
-            "country": record.country,
-            "amenities": record.amenities,
-            "star_rating": record.star_rating,
-            "static_avg_price_usd": record.avg_price_usd,
-            "live_nightly_price_usd": live_data.nightly_price_usd if live_data else None,
-            "live_total_price_usd": live_data.total_price_usd if live_data else None,
-            "is_available": live_data.is_available if live_data else None,
-            "availability_notes": live_data.availability_notes if live_data else None,
-            "distance_km": distance_info.distance_km if distance_info else None,
-            "duration_minutes": distance_info.duration_minutes if distance_info else None,
-            "source_url": record.source_url,
-        }
+    async def review_property(self, request: AgentReviewRequest) -> ValidationResult:
+        """
+        Runs a deep compatibility audit across static and dynamic data sets
+        to enforce hard business rules and verify constraints.
+        """
+        logger.info(f"Agent 3 auditing constraints evaluation for property: {request.property_id}")
+
+        # Construct explicit system context guidance
+        system_instruction = (
+            "You are an elite Travel Validation Inspector. Your job is to perform a strict "
+            "compliance audit comparing a real-estate property match against a traveler's explicit constraints.\n\n"
+            "Analyze both the static file history and live updated details to determine structural fit. "
+            "Output your analysis strictly inside the requested structural JSON schema context."
+        )
+
+        user_prompt = (
+            f"--- Traveler Requirements ---\n{json.dumps(request.user_preferences, indent=2)}\n\n"
+            f"--- Static Database Record ---\n{json.dumps(request.static_db_data, indent=2)}\n\n"
+            f"--- Live Hydration State ---\n{json.dumps(request.live_scraped_data.model_dump(), indent=2)}\n\n"
+            "Task: Verify if this property remains a sound match based on pricing, availability, and features. "
+            "Flag explicit discrepancies (e.g., if live price exceeds budget caps, or if it is marked unavailable)."
+        )
+
+        try:
+            # Request clean structured Pydantic mapping from Gemini natively
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=user_prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    response_mime_type="application/json",
+                    response_schema=ValidationResult,
+                    temperature=0.1,  # Keep reasoning steady and logical
+                ),
+            )
+
+            # Native Pydantic validation directly from the raw JSON string text payload.
+            result = ValidationResult.model_validate_json(response.text)
+            
+            # Dynamically merge or update the runtime property_id into the typed object
+            return result.model_copy(update={"property_id": request.property_id})
+
+        except Exception as e:
+            logger.error(f"Agent 3 runtime evaluation exception for {request.property_id}: {str(e)}")
+            return ValidationResult(
+                property_id=request.property_id,
+                is_valid_match=False,
+                confidence_score=0.0,
+                reasoning_summary=f"Validation failed during processing execution: {str(e)}",
+                actionable_alerts=["VALIDATION_ERROR_TRIGGERED"]
+            )
 
     async def review(
         self,
-        properties: list[PropertyRecord],
+        properties: list,
         live_prices: dict[str, LivePriceData],
         user_message: str,
-        max_budget_usd: float | None,
-        distance_info: DistanceResult | None,
-    ) -> tuple[list[VerifiedProperty], str]:
+        max_budget_usd: float | None = None,
+        distance_info: dict | None = None
+    ) -> tuple[list, str]:
         """
-        Reviews all properties and returns:
-        - List of VerifiedProperty objects (passed or failed review)
-        - Natural language assistant message summarizing results
+        Batch processes a collection of property options, lining up with the 
+        exact multi-argument signature invoked inside Stage 4 of the central Orchestrator.
         """
-        if not properties:
-            return [], (
-                "I couldn't find any properties matching your request in our database. "
-                "Try broadening your search — for example, search by country instead of city, "
-                "or remove specific amenity requirements."
-            )
+        logger.info(f"Agent 3 batch-reviewing processing pipeline for {len(properties)} properties.")
+        verified_properties = []
+        
+        # Structure the target evaluation metrics context 
+        user_preferences = {
+            "user_message": user_message,
+            "max_budget_usd": max_budget_usd
+        }
 
-        merged = [
-            self._merge_property_data(
-                p,
-                live_prices.get(p.property_id),
-                distance_info,
-            )
-            for p in properties
-        ]
+        for prop in properties:
+            # 1. Resolve or fall back the conditional dynamic Live Pricing data
+            live_scraped = live_prices.get(prop.property_id)
+            if not live_scraped:
+                # Extract target value safely matching schema attributes
+                fallback_price = getattr(prop, 'avg_price_usd', None)
+                if fallback_price is None:
+                    fallback_price = getattr(prop, 'nightly_price_usd', None)
 
-        prompt = f"""
-You are a travel recommendation reviewer. Review these properties against the user's request and return structured JSON.
-
-User request: "{user_message}"
-Budget constraint: {f"Maximum ${max_budget_usd} per night" if max_budget_usd else "No budget specified"}
-
-Properties to review:
-{json.dumps(merged, indent=2)}
-
-For each property, decide if it PASSES review based on:
-1. Budget: if max budget specified and price exceeds it → FAIL
-2. Availability: if is_available is explicitly false → FAIL
-3. Everything else: PASS (be generous, user can decide)
-
-Return ONLY valid JSON, no explanation, no markdown:
-{{
-  "reviewed_properties": [
-    {{
-      "property_id": "...",
-      "passed_review": true or false,
-      "reviewer_notes": "one sentence explaining why it passed or failed",
-      "recommended_nightly_price": number or null
-    }}
-  ],
-  "summary_message": "A warm, helpful 2-3 sentence summary of what you found. Mention the best options. If nothing passed, suggest alternatives. Be conversational, not robotic."
-}}
-"""
-
-        try:
-            response = ollama.chat(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                options={"temperature": 0.3},
-            )
-
-            raw_text = response["message"]["content"].strip()
-            raw_text = re.sub(r"```json|```", "", raw_text).strip()
-            result = json.loads(raw_text)
-
-            # Build VerifiedProperty list
-            review_map = {
-                r["property_id"]: r
-                for r in result["reviewed_properties"]
+                # FIX: Convert datetime to a clean string format (.isoformat()) to satisfy schema constraints
+                live_scraped = LivePriceData(
+                    property_id=str(prop.property_id),
+                    nightly_price_usd=fallback_price,
+                    is_available=getattr(prop, 'is_available', True),
+                    scrape_timestamp=datetime.now(timezone.utc).isoformat()
+                )
+            # 2. Package data context matrices into a single AgentReviewRequest model
+            static_db_payload = {
+                "name": getattr(prop, 'name', 'Unknown Property'),
+                "city": getattr(prop, 'city', 'Unknown City'),
+                "country": getattr(prop, 'country', 'Egypt'),
+                "amenities": getattr(prop, 'amenities', [])
             }
 
-            verified = []
-            for record in properties:
-                review = review_map.get(record.property_id, {})
-                live = live_prices.get(record.property_id)
-                dist = distance_info
+            review_request = AgentReviewRequest(
+                property_id=prop.property_id,
+                user_preferences=user_preferences,
+                static_db_data=static_db_payload,
+                live_scraped_data=live_scraped
+            )
 
-                verified.append(VerifiedProperty(
-                    property_id=record.property_id,
-                    name=record.name,
-                    property_type=record.property_type,
-                    city=record.city,
-                    country=record.country,
-                    latitude=record.latitude,
-                    longitude=record.longitude,
-                    amenities=record.amenities,
-                    star_rating=record.star_rating,
-                    nightly_price_usd=(
-                        live.nightly_price_usd if live and live.nightly_price_usd
-                        else record.avg_price_usd
-                    ),
-                    total_price_usd=live.total_price_usd if live else None,
-                    is_available=live.is_available if live else None,
-                    source_url=record.source_url,
-                    reviewer_notes=review.get("reviewer_notes", "No review available."),
-                    passed_review=review.get("passed_review", True),
-                    distance_info=dist,
-                ))
+            # 3. Fire audit checks against the underlying evaluation system model
+            validation = await self.review_property(review_request)
 
-            summary = result.get("summary_message", "Here are the properties I found for you.")
-            return verified, summary
+            # 4. Extract model data structural dictionary elements to safely mutate with metadata
+            prop_dict = prop.model_dump() if hasattr(prop, "model_dump") else prop.__dict__.copy()
+            
+            # Map parameters perfectly according to VerifiedProperty Pydantic schema expectations
+            prop_dict["passed_review"] = validation.is_valid_match
+            prop_dict["reviewer_notes"] = validation.reasoning_summary
+            prop_dict["distance_info"] = distance_info  # Injects geolocation telemetry metrics if generated
 
-        except Exception as e:
-            print(f"[Reviewer] Error: {e}")
-            # Fallback — pass everything through without review
-            verified = []
-            for record in properties:
-                live = live_prices.get(record.property_id)
-                verified.append(VerifiedProperty(
-                    property_id=record.property_id,
-                    name=record.name,
-                    property_type=record.property_type,
-                    city=record.city,
-                    country=record.country,
-                    latitude=record.latitude,
-                    longitude=record.longitude,
-                    amenities=record.amenities,
-                    star_rating=record.star_rating,
-                    nightly_price_usd=live.nightly_price_usd if live else record.avg_price_usd,
-                    total_price_usd=live.total_price_usd if live else None,
-                    is_available=live.is_available if live else None,
-                    source_url=record.source_url,
-                    reviewer_notes="Review unavailable — showing unfiltered results.",
-                    passed_review=True,
-                    distance_info=distance_info,
-                ))
-            return verified, "Here are the properties I found. Review was unavailable so results are unfiltered."
+            # Defensively ensure keys are present for frontend UI mapping
+            if "nightly_price_usd" not in prop_dict or prop_dict["nightly_price_usd"] is None:
+                prop_dict["nightly_price_usd"] = prop_dict.get("avg_price_usd", 0.0)
+
+            verified_properties.append(prop_dict)
+
+        # 5. Synthesize clean conversational context messages responding back to the Orchestrator loop
+        if distance_info:
+            origin_name = distance_info.get("origin_name", "origin").title()
+            dest_name = distance_info.get("dest_name", "destination").title()
+            distance_km = distance_info.get("distance_km", "unknown")
+            distance_text = f"The distance between {origin_name} and {dest_name} is approximately {distance_km} km."
+        else:
+            distance_text = ""
+
+        # Compose professional conversational summary framing
+        if any(p["passed_review"] for p in verified_properties):
+            summary_message = (
+                f"I discovered matching listings for your travel request. {distance_text} "
+                f"I ran an automated quality audit checking them against your preferences. Here are the top properties "
+                f"retaining live availability parameters:"
+            )
+        else:
+            summary_message = (
+                f"I processed your query and found properties, but they may have strict budget cap mismatches. "
+                f"{distance_text} Review the details below for validation reasoning alerts:"
+            )
+
+        return verified_properties, summary_message

@@ -1,15 +1,15 @@
+# backend/core/database.py
+import json
+from typing import Optional
 import chromadb
 from chromadb.config import Settings as ChromaSettings
 from sentence_transformers import SentenceTransformer
+
 from backend.core.config import settings
 from backend.core.schemas import PropertyRecord
-from typing import Optional
-import json
-
 
 # ── Singleton clients ──
 # Both are expensive to initialize. We create them once and reuse.
-
 _chroma_client: Optional[chromadb.PersistentClient] = None
 _embedding_model: Optional[SentenceTransformer] = None
 
@@ -71,22 +71,26 @@ def add_property(record: PropertyRecord) -> None:
 
     embedding = model.encode(record.description).tolist()
 
+    # Safe fallback conversions for metadata properties
+    avg_price = float(record.avg_price_usd) if record.avg_price_usd is not None else 0.0
+    rating = float(record.star_rating) if record.star_rating is not None else 0.0
+
     collection.upsert(
         ids=[record.property_id],
         embeddings=[embedding],
         documents=[record.description],
         metadatas=[{
-            "property_id": record.property_id,
-            "name": record.name,
-            "property_type": record.property_type.value,
-            "city": record.city.lower(),
-            "country": record.country.lower(),
-            "latitude": record.latitude,
-            "longitude": record.longitude,
-            "source_url": record.source_url,
+            "property_id": str(record.property_id),
+            "name": str(record.name),
+            "property_type": str(record.property_type.value),
+            "city": str(record.city).lower().strip(),
+            "country": str(record.country).lower().strip(),
+            "latitude": float(record.latitude),
+            "longitude": float(record.longitude),
+            "source_url": str(record.source_url),
             "amenities": json.dumps(record.amenities),
-            "avg_price_usd": record.avg_price_usd or 0.0,
-            "star_rating": record.star_rating or 0.0,
+            "avg_price_usd": avg_price,
+            "star_rating": rating,
         }],
     )
 
@@ -105,26 +109,35 @@ def search_properties(
     1. Embed the user query into a vector using the same model used at index time.
     2. ChromaDB finds the n_results most semantically similar property descriptions.
     3. Optional where filters narrow results BEFORE vector search (faster + cheaper).
-
-    WHY THIS ORDER (filter then search):
-    Filtering first reduces the candidate set ChromaDB searches over.
-    Searching first then filtering wastes compute on irrelevant results.
     """
     model = get_embedding_model()
     collection = get_collection()
 
+    # Defensively handle empty or missing search queries
+    if not query or not query.strip():
+        query = "comfortable stay holiday location"
+
     query_embedding = model.encode(query).tolist()
 
-    # Build metadata filter
+    # Build metadata filter mapping dynamically
     where_filter = {}
-    if city_filter:
-        where_filter["city"] = {"$eq": city_filter.lower()}
-    if property_type_filter:
-        where_filter["property_type"] = {"$eq": property_type_filter.lower()}
+    and_conditions = []
+
+    if city_filter and city_filter.strip():
+        and_conditions.append({"city": {"$eq": city_filter.lower().strip()}})
+    
+    if property_type_filter and property_type_filter.strip():
+        and_conditions.append({"property_type": {"$eq": property_type_filter.lower().strip()}})
+
+    # If multiple conditions exist, wrap them in a valid Chroma logical dictionary structure
+    if len(and_conditions) > 1:
+        where_filter = {"$and": and_conditions}
+    elif len(and_conditions) == 1:
+        where_filter = and_conditions[0]
 
     search_kwargs = {
         "query_embeddings": [query_embedding],
-        "n_results": n_results,
+        "n_results": int(n_results),
         "include": ["documents", "metadatas", "distances"],
     }
 
@@ -133,16 +146,26 @@ def search_properties(
 
     try:
         results = collection.query(**search_kwargs)
-    except Exception:
-        # If collection is empty or filter finds nothing, return empty
+    except Exception as e:
+        print(f"[Database] ChromaDB query tracking exception caught: {e}")
         return []
 
-    # Flatten ChromaDB's nested result format into clean dicts
+    # Flatten ChromaDB's nested result format into clean dicts matching schema needs
     output = []
-    if results and results["metadatas"]:
+    if results and results.get("metadatas") and len(results["metadatas"]) > 0:
         for i, metadata in enumerate(results["metadatas"][0]):
-            metadata["description"] = results["documents"][0][i]
-            metadata["similarity_score"] = 1 - results["distances"][0][i]
+            if metadata is None:
+                continue
+            
+            # Safely rebuild nested keys from documents collection matrix
+            metadata["description"] = results["documents"][0][i] if (results.get("documents") and len(results["documents"]) > 0) else ""
+            
+            # Reconstruct dynamic similarity metrics securely
+            if results.get("distances") and len(results["distances"]) > 0:
+                metadata["similarity_score"] = round(1 - results["distances"][0][i], 4)
+            else:
+                metadata["similarity_score"] = 1.0
+                
             output.append(metadata)
 
     return output
@@ -150,14 +173,16 @@ def search_properties(
 
 def get_collection_count() -> int:
     """Returns how many properties are stored. Useful for health checks."""
-    return get_collection().count()
+    try:
+        return get_collection().count()
+    except Exception:
+        return 0
 
 
 def seed_sample_data() -> None:
     """
     Inserts sample properties so the system works immediately without scraping.
     Run this once to populate the database for testing.
-    In production this gets replaced by the real scraping pipeline.
     """
     from backend.core.schemas import PropertyType
 

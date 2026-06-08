@@ -1,62 +1,56 @@
-from scrapling.fetchers import StealthyFetcher
+# backend/scrapers/scrapling_engine.py
+from datetime import datetime, timezone
+import logging
+from scrapling import Fetcher  # Safe stealth fetcher engine
+
 from backend.core.schemas import HydrationRequest, RawHydrationData
 from backend.scrapers.html_compressor import compress_html
-from datetime import datetime, timezone
-import asyncio
 
+logger = logging.getLogger(__name__)
 
 class ScraplingEngine:
     """
-    Real-time live hydration engine.
-
-    WHEN IT RUNS:
-    Only when the user explicitly asks for current prices or availability.
-    Never on every query — that would be too slow and risk IP blocking.
-
-    HOW STEALTHYFETCHER WORKS:
-    - Launches a real Playwright browser (Chromium) headlessly
-    - Executes JavaScript — gets the fully rendered DOM, not raw HTML
-    - Randomizes fingerprints (user-agent, screen size, timezone, WebGL)
-    - Mimics human mouse movements and scroll patterns
-    - Bypasses Cloudflare and most anti-bot systems
+    Executes high-stealth web scraping requests for live pricing and 
+    availability updates, instantly compressing data to minimize LLM overhead.
     """
+    def __init__(self):
+        # We can configure custom headers or regional proxies here if necessary
+        pass
 
     async def hydrate(self, request: HydrationRequest) -> RawHydrationData:
         """
-        Fetches a live property page and returns compressed HTML for Agent 2.
-        Runs in a thread pool because Scrapling is synchronous internally.
+        Fetches live web content for a target booking URL and returns 
+        token-optimized HTML payload ready for processing.
         """
-        print(f"[Scrapling] Hydrating: {request.source_url}")
-
-        # Run the synchronous scraper in a thread to avoid blocking FastAPI's event loop
-        raw_html = await asyncio.to_thread(self._scrape, request.source_url)
-
-        compressed = compress_html(raw_html)
-        timestamp = datetime.now(timezone.utc).isoformat()
-
-        print(f"[Scrapling] Done. Compressed HTML: {len(compressed)} chars.")
-
-        return RawHydrationData(
-            property_id=request.property_id,
-            source_url=request.source_url,
-            compressed_html=compressed,
-            scrape_timestamp=timestamp,
-        )
-
-    def _scrape(self, url: str) -> str:
-        """
-        Synchronous scraping call — runs inside asyncio.to_thread.
-        Returns raw HTML string of the fully rendered page.
-        """
+        logger.info(f"Initiating live hydration capture for property: {request.property_id}")
+        
         try:
-            fetcher = StealthyFetcher(auto_match=False)
-            page = fetcher.fetch(
-                url,
-                headless=True,
-                network_idle=True,       # Wait until all XHR/fetch calls complete
-                timeout=30000,           # 30 second timeout
+            # Fetch content natively using Scrapling's specialized fetchers
+            # It uses anti-bot fingerprint bypasses automatically
+            fetcher = Fetcher(url=request.source_url)
+            
+            raw_html = fetcher.content
+            if not raw_html:
+                raise ValueError("Received empty HTML content response from target url.")
+
+            # Pass the raw markup straight through your newly optimized token compressor
+            # Using standard 8000 character limits for local model bounds
+            optimized_text = compress_html(raw_html, max_chars=8000)
+
+            return RawHydrationData(
+                property_id=request.property_id,
+                source_url=request.source_url,
+                compressed_html=optimized_text,
+                scrape_timestamp=datetime.now(timezone.utc).isoformat()
             )
-            return page.html_content
+
         except Exception as e:
-            print(f"[Scrapling] Error scraping {url}: {e}")
-            return ""
+            logger.error(f"Hydration pipeline failure for property {request.property_id}: {str(e)}")
+            # Fallback gracefully with an error indicator inside the context string 
+            # to let downstream agents explicitly notice missing data fields.
+            return RawHydrationData(
+                property_id=request.property_id,
+                source_url=request.source_url,
+                compressed_html=f"[ERROR] Live scraping failed: {str(e)}",
+                scrape_timestamp=datetime.now(timezone.utc).isoformat()
+            )

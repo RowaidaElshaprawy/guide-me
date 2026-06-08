@@ -137,3 +137,42 @@ class ChatResponse(BaseModel):
     properties: list[VerifiedProperty]
     pipeline_stage_reached: PipelineStage
     error: Optional[str] = None
+    
+    
+    
+# backend/core/schemas.py
+from pydantic import BaseModel, Field
+from typing import Optional, List
+
+class HydrationRequest(BaseModel):
+    property_id: str
+    source_url: str
+
+class RawHydrationData(BaseModel):
+    property_id: str
+    source_url: str
+    compressed_html: str
+    scrape_timestamp: str
+
+class LivePriceData(BaseModel):
+    property_id: str
+    nightly_price_usd: Optional[float] = None
+    total_price_usd: Optional[float] = None
+    currency_original: Optional[str] = None
+    cleaning_fee_usd: Optional[float] = None
+    is_available: Optional[bool] = True
+    availability_notes: Optional[str] = None
+    scrape_timestamp: str
+
+class AgentReviewRequest(BaseModel):
+    property_id: str
+    static_db_data: dict
+    live_scraped_data: LivePriceData
+    user_preferences: dict
+
+class ValidationResult(BaseModel):
+    property_id: str
+    is_valid_match: bool
+    confidence_score: float
+    reasoning_summary: str
+    actionable_alerts: List[str] = Field(default_factory=list)

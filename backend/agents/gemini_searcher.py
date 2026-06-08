@@ -1,4 +1,5 @@
-import google.generativeai as genai
+# backend/gemini_search.py
+from google import genai
 import httpx
 import json
 from backend.core.config import settings
@@ -19,31 +20,23 @@ class GeminiSearcher:
     3. Geocode locations using Nominatim (free OSM API)
     4. Calculate distances using OSRM (free routing API)
     5. Decide whether live hydration (Scrapling) is needed
-
-    WHY GEMINI FLASH SPECIFICALLY:
-    - Free tier: 15 requests/minute, 1 million tokens/day
-    - Fast enough for real-time chat responses
-    - Strong enough for intent parsing and decision making
-    - We only use it for Agent 1 — Agents 2 & 3 use local Phi-3 Mini
     """
 
     def __init__(self):
-        genai.configure(api_key=settings.gemini_api_key)
-        self.model = genai.GenerativeModel(settings.gemini_model)
+        # Stateful SDK initialization pattern passing the API key directly
+        self.client = genai.Client(api_key=settings.gemini_api_key)
+        
+        # FIX: Dynamically strip out legacy "models/" prefix layout syntax if present
+        configured_model = settings.gemini_model
+        if configured_model.startswith("models/"):
+            self.model_name = configured_model.replace("models/", "", 1)
+        else:
+            self.model_name = configured_model
 
     async def parse_query_intent(self, user_message: str, conversation_history: list) -> dict:
         """
         Uses Gemini to extract structured intent from natural language.
-
-        Returns a dict with:
-        - city: extracted city name or None
-        - country: extracted country name or None
-        - property_type: hotel/apartment/chalet/villa or None
-        - max_budget_usd: numeric budget or None
-        - amenities_requested: list of requested amenities
-        - wants_live_prices: bool — did user ask for current prices?
-        - distance_query: dict with origin/destination if user asks "how far"
-        - search_query: reformulated query optimized for semantic vector search
+        Leverages the modern SDK's native schema enforcement.
         """
         history_text = ""
         if conversation_history:
@@ -53,44 +46,61 @@ class GeminiSearcher:
                 for m in recent
             ])
 
-        prompt = f"""
-You are a travel query parser. Extract structured information from the user message.
-Return ONLY valid JSON, no explanation, no markdown, no backticks.
+        system_instruction = (
+            "You are a travel query parser. Your job is to extract structured information "
+            "from the traveler's message and return a clean data object matching the requested schema."
+        )
 
+        user_prompt = f"""
 Conversation history (for context):
 {history_text}
 
 User message: "{user_message}"
 
-Return exactly this JSON structure:
-{{
-  "city": "city name or null",
-  "country": "country name or null",
-  "property_type": "hotel or apartment or chalet or villa or null",
-  "max_budget_usd": number or null,
-  "amenities_requested": ["amenity1", "amenity2"],
-  "wants_live_prices": true or false,
-  "distance_query": {{
-    "origin": "place name or null",
-    "destination": "place name or null"
-  }},
-  "search_query": "a natural language query optimized for semantic search about travel accommodations"
-}}
-
-Rules:
-- wants_live_prices is true if user says: current price, available, book, tonight, this weekend
-- distance_query origin and destination are null unless user explicitly asks about distance
-- search_query should be descriptive and mention property features, location feel, and traveler type
+Rules for fields:
+- wants_live_prices is true if user says: current price, live rates, available, book, tonight, this weekend, or asks for prices right now.
+- distance_query origin and destination should remain null unless the user explicitly asks about distances or routes.
+- search_query should be a descriptive natural language phrasing optimized for semantic search vector databases.
 """
+        
+        # Define an explicit structure inline using Pydantic or basic types
+        # to guarantee the shape returned by the Gemini engine.
         try:
-            response = self.model.generate_content(prompt)
-            raw = response.text.strip()
-            # Strip markdown code fences if Gemini adds them
-            raw = raw.replace("```json", "").replace("```", "").strip()
-            return json.loads(raw)
+            from pydantic import BaseModel, Field
+            from typing import Optional, List
+
+            class DistanceQuerySchema(BaseModel):
+                origin: Optional[str] = None
+                destination: Optional[str] = None
+
+            class IntentSchema(BaseModel):
+                city: Optional[str] = None
+                country: Optional[str] = None
+                property_type: Optional[str] = None
+                max_budget_usd: Optional[float] = None
+                amenities_requested: List[str] = Field(default_factory=list)
+                wants_live_prices: bool = False
+                distance_query: DistanceQuerySchema
+                search_query: str
+
+            # OPTIMIZATION: Request structured output natively from the API model
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=user_prompt,
+                config={
+                    "system_instruction": system_instruction,
+                    "response_mime_type": "application/json",
+                    "response_schema": IntentSchema,
+                    "temperature": 0.1
+                }
+            )
+            
+            # The .text value is guaranteed to conform exactly to IntentSchema layout
+            return json.loads(response.text)
+            
         except Exception as e:
-            print(f"[GeminiSearcher] Intent parsing failed: {e}")
-            # Fallback: treat entire message as search query
+            print(f"[GeminiSearcher] Native intent parsing optimization failed: {e}")
+            # Fallback: treat entire message as search query safely
             return {
                 "city": None,
                 "country": None,
@@ -105,7 +115,6 @@ Rules:
     async def geocode_location(self, location: str) -> GeocodingResult | None:
         """
         Converts a place name to coordinates using Nominatim (free OSM geocoding).
-        No API key required. Rate limit: 1 request/second — we respect it.
         """
         try:
             async with httpx.AsyncClient() as client:
@@ -147,7 +156,6 @@ Rules:
     ) -> DistanceResult | None:
         """
         Calculates driving distance and duration using OSRM (free routing API).
-        No API key required.
         """
         try:
             url = (
@@ -207,15 +215,11 @@ Rules:
         conversation_history: list,
     ) -> VectorSearchResult:
         """
-        Full Agent 1 execution:
-        1. Parse intent with Gemini
-        2. Search ChromaDB with semantic query + metadata filters
-        3. Geocode location if found
-        4. Decide if live hydration is needed
+        Full Agent 1 execution loop.
         """
         print(f"[GeminiSearcher] Processing: '{user_message}'")
 
-        # Step 1 — Parse intent
+        # Step 1 — Parse intent safely
         intent = await self.parse_query_intent(user_message, conversation_history)
         print(f"[GeminiSearcher] Intent: {intent}")
 
@@ -230,7 +234,7 @@ Rules:
 
         properties = [self._metadata_to_property_record(r) for r in raw_results]
 
-        # Step 3 — Geocode if we have a location
+        # Step 3 — Geocode location contexts
         location_context = None
         if intent.get("city"):
             query_location = intent["city"]
@@ -238,8 +242,7 @@ Rules:
                 query_location += f", {intent['country']}"
             location_context = await self.geocode_location(query_location)
 
-        # Step 4 — Decide on live hydration
-        # Trigger if: user wants live prices OR no properties found in static DB
+        # Step 4 — Formulate execution requirements
         requires_hydration = intent.get("wants_live_prices", False) or len(properties) == 0
 
         return VectorSearchResult(
