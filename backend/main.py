@@ -10,33 +10,22 @@ from backend.api.chat_router import router as chat_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Startup:
-    1. Seed ChromaDB with sample data if empty
-    2. Initialize the Orchestrator (loads all agents)
-    3. Store Orchestrator in app.state for reuse across requests
-
-    Shutdown:
-    - Nothing to clean up for now (ChromaDB auto-saves to disk)
-    """
     print(f"[{settings.app_name}] Starting up...")
 
-    # Seed database if empty
     count = database.get_collection_count()
     if count == 0:
-        print("[Startup] Database is empty. Seeding sample data...")
+        print("[Startup] Empty database — seeding sample data...")
         database.seed_sample_data()
     else:
-        print(f"[Startup] Database has {count} properties. Skipping seed.")
+        print(f"[Startup] Database has {count} properties.")
 
-    # Initialize orchestrator once — agents load here
-    print("[Startup] Initializing Orchestrator and all agents...")
+    print("[Startup] Initializing Orchestrator...")
     app.state.orchestrator = Orchestrator(settings)
     print("[Startup] All systems ready.")
 
     yield
 
-    print(f"[{settings.app_name}] Shutdown complete.")
+    print(f"[{settings.app_name}] Shutdown.")
 
 
 app = FastAPI(
@@ -60,8 +49,4 @@ app.include_router(chat_router, prefix="/api")
 @app.get("/health")
 async def health_check():
     count = database.get_collection_count()
-    return {
-        "status": "ok",
-        "env": settings.app_env,
-        "properties_in_db": count,
-    }
+    return {"status": "ok", "env": settings.app_env, "properties_in_db": count}

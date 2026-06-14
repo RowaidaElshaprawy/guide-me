@@ -1,142 +1,206 @@
-# backend/gemini_search.py
-from google import genai
+# backend/agents/gemini_searcher.py
 import httpx
 import json
+import re
 from backend.core.config import settings
 from backend.core.schemas import (
     VectorSearchResult, PropertyRecord, PropertyType,
-    GeocodingResult, DistanceResult, HydrationRequest
+    GeocodingResult, DistanceResult,
 )
 from backend.core import database
+from backend.agents.providers import ProviderRouter, ProviderError
 
 
 class GeminiSearcher:
     """
-    Agent 1 — The Decision Maker.
-
-    RESPONSIBILITIES:
-    1. Parse the user's natural language query for intent, location, and constraints
-    2. Query ChromaDB using semantic vector search
-    3. Geocode locations using Nominatim (free OSM API)
-    4. Calculate distances using OSRM (free routing API)
-    5. Decide whether live hydration (Scrapling) is needed
+    Agent 1 — Intent Parser & Vector Search Coordinator.
+    Uses ProviderRouter for automatic Gemini → Groq failover.
     """
 
     def __init__(self):
-        # Stateful SDK initialization pattern passing the API key directly
-        self.client = genai.Client(api_key=settings.gemini_api_key)
-        
-        # FIX: Dynamically strip out legacy "models/" prefix layout syntax if present
-        configured_model = settings.gemini_model
-        if configured_model.startswith("models/"):
-            self.model_name = configured_model.replace("models/", "", 1)
-        else:
-            self.model_name = configured_model
+        self._router: ProviderRouter | None = None
 
-    async def parse_query_intent(self, user_message: str, conversation_history: list) -> dict:
-        """
-        Uses Gemini to extract structured intent from natural language.
-        Leverages the modern SDK's native schema enforcement.
-        """
-        history_text = ""
-        if conversation_history:
-            recent = conversation_history[-4:]  # Last 4 turns for context
-            history_text = "\n".join([
-                f"{m['role'].upper()}: {m['content']}"
-                for m in recent
-            ])
+    @property
+    def router(self) -> ProviderRouter:
+        if self._router is None:
+            self._router = ProviderRouter()
+        return self._router
 
-        system_instruction = (
-            "You are a travel query parser. Your job is to extract structured information "
-            "from the traveler's message and return a clean data object matching the requested schema."
+    def _fallback_intent(
+        self,
+        user_message: str,
+        conversation_history: list | None = None,
+    ) -> dict:
+        text = user_message.lower()
+        city_aliases = {
+            "cairo": "Cairo",
+            "giza": "Cairo",
+            "pyramid": "Cairo",
+            "pyramids": "Cairo",
+            "great pyramid": "Cairo",
+            "great pyramids": "Cairo",
+            "sphinx": "Cairo",
+            "luxor": "Luxor",
+            "hurghada": "Hurghada",
+            "sharm el sheikh": "Sharm El Sheikh",
+            "sharm": "Sharm El Sheikh",
+            "siwa": "Siwa",
+            "dahab": "Dahab",
+        }
+        property_type_aliases = {
+            "hotel": "hotel",
+            "hotels": "hotel",
+            "resort": "hotel",
+            "resorts": "hotel",
+            "guesthouse": "hotel",
+            "guesthouses": "hotel",
+            "apartment": "apartment",
+            "apartments": "apartment",
+            "flat": "apartment",
+            "flats": "apartment",
+            "chalet": "chalet",
+            "chalets": "chalet",
+            "villa": "villa",
+            "villas": "villa",
+        }
+        city = _find_city(text, city_aliases)
+        property_type = _find_property_type(text, property_type_aliases)
+        distance_query = _extract_distance_query(text, city_aliases)
+
+        if conversation_history and (not city or not property_type):
+            history_text = " ".join(
+                m.get("content", "")
+                for m in conversation_history[-4:]
+                if m.get("role") == "user"
+            ).lower()
+            city = city or _find_city(history_text, city_aliases)
+            property_type = property_type or _find_property_type(
+                history_text, property_type_aliases
+            )
+
+        budget_match = re.search(
+            r"(?:under|below|less than|max(?:imum)?|budget)\s*\$?\s*(\d+)",
+            text,
+        )
+        max_budget = float(budget_match.group(1)) if budget_match else None
+        amenities = [
+            amenity
+            for amenity in (
+                "pool",
+                "wifi",
+                "breakfast",
+                "gym",
+                "spa",
+                "beach",
+                "kitchen",
+                "diving",
+                "private beach",
+                "nile view",
+                "sea view",
+                "desert view",
+            )
+            if amenity in text
+        ]
+        return {
+            "city": city,
+            "country": "Egypt",
+            "property_type": property_type,
+            "max_budget_usd": max_budget,
+            "amenities_requested": amenities,
+            "wants_live_prices": any(
+                phrase in text
+                for phrase in ("current price", "available", "book", "tonight", "this weekend")
+            ),
+            "wants_to_book": any(
+                phrase in text for phrase in ("book", "reserve", "confirm", "proceed")
+            ),
+            "check_in": None,
+            "check_out": None,
+            "guests": 2,
+            "distance_query": distance_query,
+            "search_query": user_message,
+        }
+
+    def _can_use_fast_intent(self, intent: dict) -> bool:
+        return bool(
+            intent.get("city")
+            or intent.get("property_type")
+            or intent.get("max_budget_usd")
+            or intent.get("wants_live_prices")
+            or intent.get("wants_to_book")
+            or (intent.get("distance_query") or {}).get("origin")
         )
 
-        user_prompt = f"""
-Conversation history (for context):
+    async def parse_query_intent(self, user_message: str, conversation_history: list) -> dict:
+        fast_intent = self._fallback_intent(user_message, conversation_history)
+        if self._can_use_fast_intent(fast_intent):
+            return fast_intent
+
+        history_text = ""
+        if conversation_history:
+            recent = conversation_history[-4:]
+            history_text = "\n".join([
+                f"{m['role'].upper()}: {m['content']}" for m in recent
+            ])
+
+        prompt = f"""
+You are a travel query parser for Egypt. Extract structured information from the user message.
+Return ONLY valid JSON, no explanation, no markdown, no backticks.
+
+Conversation history:
 {history_text}
 
 User message: "{user_message}"
 
-Rules for fields:
-- wants_live_prices is true if user says: current price, live rates, available, book, tonight, this weekend, or asks for prices right now.
-- distance_query origin and destination should remain null unless the user explicitly asks about distances or routes.
-- search_query should be a descriptive natural language phrasing optimized for semantic search vector databases.
+Return exactly this JSON structure:
+{{
+  "city": "Egyptian city name or null (e.g. Cairo, Hurghada, Luxor, Siwa, Sharm El Sheikh, Dahab)",
+  "country": "Egypt or null",
+  "property_type": "hotel or apartment or chalet or villa or null",
+  "max_budget_usd": number or null,
+  "amenities_requested": ["amenity1", "amenity2"],
+  "wants_live_prices": true or false,
+  "wants_to_book": true or false,
+  "check_in": "YYYY-MM-DD or null",
+  "check_out": "YYYY-MM-DD or null",
+  "guests": number or null,
+  "distance_query": {{
+    "origin": "place name or null",
+    "destination": "place name or null"
+  }},
+  "search_query": "natural language query for semantic vector search about Egypt stays"
+}}
+
+Rules:
+- wants_live_prices is true if user mentions:
+  current price, available, book, tonight, this weekend, prices now
+- wants_to_book is true if user says: book, reserve, I want this one, confirm, proceed
+- Extract check_in/check_out dates if mentioned in any format
+- city must be an Egyptian location or null
+- search_query should be descriptive: mention location, property features, traveler type
 """
-        
-        # Define an explicit structure inline using Pydantic or basic types
-        # to guarantee the shape returned by the Gemini engine.
         try:
-            from pydantic import BaseModel, Field
-            from typing import Optional, List
-
-            class DistanceQuerySchema(BaseModel):
-                origin: Optional[str] = None
-                destination: Optional[str] = None
-
-            class IntentSchema(BaseModel):
-                city: Optional[str] = None
-                country: Optional[str] = None
-                property_type: Optional[str] = None
-                max_budget_usd: Optional[float] = None
-                amenities_requested: List[str] = Field(default_factory=list)
-                wants_live_prices: bool = False
-                distance_query: DistanceQuerySchema
-                search_query: str
-
-            # OPTIMIZATION: Request structured output natively from the API model
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=user_prompt,
-                config={
-                    "system_instruction": system_instruction,
-                    "response_mime_type": "application/json",
-                    "response_schema": IntentSchema,
-                    "temperature": 0.1
-                }
-            )
-            
-            # The .text value is guaranteed to conform exactly to IntentSchema layout
-            return json.loads(response.text)
-            
-        except Exception as e:
-            print(f"[GeminiSearcher] Native intent parsing optimization failed: {e}")
-            # Fallback: treat entire message as search query safely
-            return {
-                "city": None,
-                "country": None,
-                "property_type": None,
-                "max_budget_usd": None,
-                "amenities_requested": [],
-                "wants_live_prices": False,
-                "distance_query": {"origin": None, "destination": None},
-                "search_query": user_message,
-            }
+            raw = self.router.generate(prompt, temperature=0.1)
+            raw = ProviderRouter.clean_json(raw)
+            return json.loads(raw)
+        except (ProviderError, json.JSONDecodeError) as e:
+            print(f"[GeminiSearcher] Intent parsing failed: {e}. Using fallback.")
+            return self._fallback_intent(user_message, conversation_history)
 
     async def geocode_location(self, location: str) -> GeocodingResult | None:
-        """
-        Converts a place name to coordinates using Nominatim (free OSM geocoding).
-        """
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.get(
                     f"{settings.nominatim_base_url}/search",
-                    params={
-                        "q": location,
-                        "format": "json",
-                        "limit": 1,
-                        "addressdetails": 1,
-                    },
-                    headers={"User-Agent": "TravelAgentBot/1.0 (educational project)"},
+                    params={"q": location, "format": "json", "limit": 1, "addressdetails": 1},
+                    headers={"User-Agent": "GuideMe-TravelBot/1.0 (graduation project)"},
                     timeout=10.0,
                 )
                 data = response.json()
-
             if not data:
                 return None
-
             result = data[0]
             address = result.get("address", {})
-
             return GeocodingResult(
                 display_name=result.get("display_name", location),
                 latitude=float(result["lat"]),
@@ -154,46 +218,32 @@ Rules for fields:
         dest_lat: float, dest_lon: float,
         origin_name: str, dest_name: str,
     ) -> DistanceResult | None:
-        """
-        Calculates driving distance and duration using OSRM (free routing API).
-        """
         try:
             url = (
                 f"{settings.osrm_base_url}/route/v1/driving/"
                 f"{origin_lon},{origin_lat};{dest_lon},{dest_lat}"
             )
             async with httpx.AsyncClient() as client:
-                response = await client.get(
-                    url,
-                    params={"overview": "false", "alternatives": "false"},
-                    timeout=10.0,
-                )
+                response = await client.get(url, params={"overview": "false"}, timeout=10.0)
                 data = response.json()
-
             if data.get("code") != "Ok":
                 return None
-
             route = data["routes"][0]
-            distance_km = round(route["distance"] / 1000, 1)
-            duration_min = round(route["duration"] / 60, 0)
-
             return DistanceResult(
                 origin=origin_name,
                 destination=dest_name,
-                distance_km=distance_km,
-                duration_minutes=duration_min,
+                distance_km=round(route["distance"] / 1000, 1),
+                duration_minutes=round(route["duration"] / 60, 0),
             )
         except Exception as e:
-            print(f"[GeminiSearcher] Distance calculation failed: {e}")
+            print(f"[GeminiSearcher] Distance failed: {e}")
             return None
 
-    def _metadata_to_property_record(self, metadata: dict) -> PropertyRecord:
-        """Converts ChromaDB flat metadata dict back into a typed PropertyRecord."""
-        import json as json_lib
+    def _metadata_to_record(self, metadata: dict) -> PropertyRecord:
+        import json as j
         amenities = metadata.get("amenities", "[]")
         if isinstance(amenities, str):
-            amenities = json_lib.loads(amenities)
-
+            amenities = j.loads(amenities)
         return PropertyRecord(
             property_id=metadata["property_id"],
             name=metadata["name"],
@@ -213,36 +263,31 @@ Rules for fields:
         self,
         user_message: str,
         conversation_history: list,
+        intent: dict | None = None,
     ) -> VectorSearchResult:
-        """
-        Full Agent 1 execution loop.
-        """
         print(f"[GeminiSearcher] Processing: '{user_message}'")
-
-        # Step 1 — Parse intent safely
-        intent = await self.parse_query_intent(user_message, conversation_history)
+        if intent is None:
+            intent = await self.parse_query_intent(user_message, conversation_history)
         print(f"[GeminiSearcher] Intent: {intent}")
 
-        # Step 2 — Search ChromaDB
         raw_results = database.search_properties(
             query=intent["search_query"],
             city_filter=intent.get("city"),
             property_type_filter=intent.get("property_type"),
             max_price_filter=intent.get("max_budget_usd"),
             n_results=5,
+            prefer_keyword=self._can_use_fast_intent(intent),
         )
+        properties = [self._metadata_to_record(r) for r in raw_results]
 
-        properties = [self._metadata_to_property_record(r) for r in raw_results]
-
-        # Step 3 — Geocode location contexts
         location_context = None
-        if intent.get("city"):
-            query_location = intent["city"]
+        distance_query = intent.get("distance_query") or {}
+        if intent.get("city") and distance_query.get("origin") and distance_query.get("destination"):
+            loc = intent["city"]
             if intent.get("country"):
-                query_location += f", {intent['country']}"
-            location_context = await self.geocode_location(query_location)
+                loc += f", {intent['country']}"
+            location_context = await self.geocode_location(loc)
 
-        # Step 4 — Formulate execution requirements
         requires_hydration = intent.get("wants_live_prices", False) or len(properties) == 0
 
         return VectorSearchResult(
@@ -251,3 +296,50 @@ Rules for fields:
             requires_live_hydration=requires_hydration,
             location_context=location_context,
         )
+
+
+def _find_city(text: str, city_aliases: dict[str, str]) -> str | None:
+    matches = [
+        (text.find(alias), len(alias), city)
+        for alias, city in city_aliases.items()
+        if alias in text
+    ]
+    if not matches:
+        return None
+    return sorted(matches, key=lambda item: (item[0], -item[1]))[0][2]
+
+
+def _find_property_type(text: str, property_type_aliases: dict[str, str]) -> str | None:
+    tokens = set(re.findall(r"[a-z]+", text))
+    for alias, property_type in property_type_aliases.items():
+        if alias in tokens:
+            return property_type
+    return None
+
+
+def _extract_distance_query(text: str, city_aliases: dict[str, str]) -> dict:
+    empty = {"origin": None, "destination": None}
+    if not any(phrase in text for phrase in ("how far", "distance", "drive", "route")):
+        return empty
+
+    city_matches = []
+    for alias, city in city_aliases.items():
+        index = text.find(alias)
+        if index >= 0:
+            city_matches.append((index, len(alias), city))
+
+    unique_cities = []
+    for _, _, city in sorted(city_matches, key=lambda item: (item[0], -item[1])):
+        if city not in unique_cities:
+            unique_cities.append(city)
+
+    if len(unique_cities) < 2:
+        return empty
+
+    if re.search(r"\bfrom\b.+\bto\b", text):
+        return {"origin": unique_cities[0], "destination": unique_cities[1]}
+
+    if re.search(r"\bfrom\b", text):
+        return {"origin": unique_cities[1], "destination": unique_cities[0]}
+
+    return {"origin": unique_cities[0], "destination": unique_cities[1]}

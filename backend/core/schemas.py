@@ -1,3 +1,4 @@
+# backend/core/schemas.py
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 from enum import Enum
@@ -16,6 +17,13 @@ class PipelineStage(str, Enum):
     CLEANING = "cleaning"
     REVIEW = "review"
     COMPLETE = "complete"
+
+
+class ScrapeStatus(str, Enum):
+    SUCCESS = "success"
+    STRUCTURE_CHANGED = "structure_changed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
 
 
 # ── Frontend → FastAPI ──
@@ -45,10 +53,10 @@ class PropertyRecord(BaseModel):
     amenities: list[str]
     avg_price_usd: Optional[float] = None
     star_rating: Optional[float] = None
-    description: str  # This string gets embedded into ChromaDB
+    description: str
 
 
-# ── Geocoding result from Nominatim ──
+# ── Geocoding / Distance ──
 
 class GeocodingResult(BaseModel):
     display_name: str
@@ -57,8 +65,6 @@ class GeocodingResult(BaseModel):
     city: Optional[str] = None
     country: Optional[str] = None
 
-
-# ── Distance result from OSRM ──
 
 class DistanceResult(BaseModel):
     origin: str
@@ -76,7 +82,7 @@ class VectorSearchResult(BaseModel):
     location_context: Optional[GeocodingResult] = None
 
 
-# ── Scraper input ──
+# ── Scraper contracts ──
 
 class HydrationRequest(BaseModel):
     property_id: str
@@ -86,13 +92,12 @@ class HydrationRequest(BaseModel):
     guests: int = 2
 
 
-# ── Scraper raw output → Agent 2 input ──
-
 class RawHydrationData(BaseModel):
     property_id: str
     source_url: str
     compressed_html: str
     scrape_timestamp: str
+    scrape_status: ScrapeStatus = ScrapeStatus.SUCCESS
 
 
 # ── Agent 2 output ──
@@ -106,9 +111,34 @@ class LivePriceData(BaseModel):
     is_available: Optional[bool] = None
     availability_notes: Optional[str] = None
     scrape_timestamp: str
+    scrape_status: ScrapeStatus = ScrapeStatus.SKIPPED
 
 
-# ── Agent 3 final verified output ──
+# ── Booking Intent (new — for autonomous booking flow) ──
+
+class BookingIntent(BaseModel):
+    """
+    Collected conversationally before generating the pre-filled booking deeplink.
+    The system autonomously assembles this and generates a ready-to-click URL.
+    """
+    property_id: str
+    property_name: str
+    source_url: str
+    check_in: Optional[str] = None       # ISO format: YYYY-MM-DD
+    check_out: Optional[str] = None
+    guests: int = 2
+    rooms: int = 1
+    guest_name: Optional[str] = None
+    booking_url: Optional[str] = None    # Generated pre-filled deeplink
+    nightly_price_usd: Optional[float] = None
+    total_price_usd: Optional[float] = None
+    is_available: Optional[bool] = None
+    scrape_status: ScrapeStatus = ScrapeStatus.SKIPPED
+    price_source: str = "database"
+    status_message: Optional[str] = None
+
+
+# ── Final verified output ──
 
 class VerifiedProperty(BaseModel):
     property_id: str
@@ -127,6 +157,8 @@ class VerifiedProperty(BaseModel):
     reviewer_notes: str
     passed_review: bool
     distance_info: Optional[DistanceResult] = None
+    scrape_status: ScrapeStatus = ScrapeStatus.SKIPPED
+    booking_url: Optional[str] = None    # Pre-filled booking deeplink
 
 
 # ── FastAPI → Streamlit ──
@@ -137,42 +169,4 @@ class ChatResponse(BaseModel):
     properties: list[VerifiedProperty]
     pipeline_stage_reached: PipelineStage
     error: Optional[str] = None
-    
-    
-    
-# backend/core/schemas.py
-from pydantic import BaseModel, Field
-from typing import Optional, List
-
-class HydrationRequest(BaseModel):
-    property_id: str
-    source_url: str
-
-class RawHydrationData(BaseModel):
-    property_id: str
-    source_url: str
-    compressed_html: str
-    scrape_timestamp: str
-
-class LivePriceData(BaseModel):
-    property_id: str
-    nightly_price_usd: Optional[float] = None
-    total_price_usd: Optional[float] = None
-    currency_original: Optional[str] = None
-    cleaning_fee_usd: Optional[float] = None
-    is_available: Optional[bool] = True
-    availability_notes: Optional[str] = None
-    scrape_timestamp: str
-
-class AgentReviewRequest(BaseModel):
-    property_id: str
-    static_db_data: dict
-    live_scraped_data: LivePriceData
-    user_preferences: dict
-
-class ValidationResult(BaseModel):
-    property_id: str
-    is_valid_match: bool
-    confidence_score: float
-    reasoning_summary: str
-    actionable_alerts: List[str] = Field(default_factory=list)
+    booking_intent: Optional[BookingIntent] = None

@@ -1,38 +1,43 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
 
 
 class Settings(BaseSettings):
-    # Application
-    app_name: str = "Travel Agent Bot"
+    app_name: str = "Guide Me"
     app_env: str = "development"
     debug: bool = True
 
-    # FastAPI
+    @field_validator("debug", mode="before")
+    @classmethod
+    def parse_debug_mode_words(cls, value):
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"release", "production", "prod"}:
+                return False
+            if normalized in {"development", "dev"}:
+                return True
+        return value
+
     api_host: str = "127.0.0.1"
     api_port: int = 8000
 
-    # Gemini — free tier: 15 rpm, 1M tokens/day
     gemini_api_key: str
     gemini_model: str = "gemini-1.5-flash"
 
-    # ChromaDB — fully local
+    groq_api_key: str = ""
+    groq_model: str = "llama-3.3-70b-versatile"
+
     chroma_persist_directory: str = "./data/chromadb"
     chroma_collection_name: str = "travel_properties"
-
-    # Sentence Transformers — fully local embedding model
     embedding_model: str = "all-MiniLM-L6-v2"
 
-    # Ollama — fully local
     ollama_base_url: str = "http://localhost:11434"
     ollama_cleaner_model: str = "phi3:mini"
-    ollama_reviewer_model: str = "phi3:mini"
 
-    # Free geocoding & routing — no API key needed
     nominatim_base_url: str = "https://nominatim.openstreetmap.org"
     osrm_base_url: str = "https://router.project-osrm.org"
 
-    # Streamlit -> FastAPI
     api_base_url: str = "http://127.0.0.1:8000"
 
     model_config = SettingsConfigDict(

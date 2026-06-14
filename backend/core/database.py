@@ -1,26 +1,60 @@
-# backend/core/database.py
-import json
-from typing import Optional
-import chromadb
-from chromadb.config import Settings as ChromaSettings
-from sentence_transformers import SentenceTransformer
-
 from backend.core.config import settings
-from backend.core.schemas import PropertyRecord
+from backend.core.schemas import PropertyRecord, PropertyType
+from typing import Any, Optional
+import json
+import re
+from urllib.parse import quote_plus
 
-# ── Singleton clients ──
-# Both are expensive to initialize. We create them once and reuse.
-_chroma_client: Optional[chromadb.PersistentClient] = None
-_embedding_model: Optional[SentenceTransformer] = None
+CITY_ALIASES = {
+    "cairo": "cairo",
+    "giza": "cairo",
+    "pyramid": "cairo",
+    "pyramids": "cairo",
+    "great pyramid": "cairo",
+    "great pyramids": "cairo",
+    "sphinx": "cairo",
+    "luxor": "luxor",
+    "hurghada": "hurghada",
+    "sharm": "sharm el sheikh",
+    "sharm el sheikh": "sharm el sheikh",
+    "sharm-el-sheikh": "sharm el sheikh",
+    "siwa": "siwa",
+    "dahab": "dahab",
+}
+
+PROPERTY_TYPE_ALIASES = {
+    "hotel": "hotel",
+    "hotels": "hotel",
+    "resort": "hotel",
+    "resorts": "hotel",
+    "guesthouse": "hotel",
+    "guesthouses": "hotel",
+    "apartment": "apartment",
+    "apartments": "apartment",
+    "flat": "apartment",
+    "flats": "apartment",
+    "chalet": "chalet",
+    "chalets": "chalet",
+    "villa": "villa",
+    "villas": "villa",
+}
+
+EXACT_PROPERTY_URLS = {
+    "prop_005": "https://www.booking.com/hotel/eg/luxor-guest-house.en-gb.html",
+}
 
 
-def get_chroma_client() -> chromadb.PersistentClient:
-    """
-    Returns a persistent ChromaDB client.
-    Data survives restarts because it writes to disk at chroma_persist_directory.
-    """
+_chroma_client: Optional[Any] = None
+_embedding_model: Optional[Any] = None
+_embedding_model_error: Optional[Exception] = None
+
+
+def get_chroma_client() -> Any:
     global _chroma_client
     if _chroma_client is None:
+        import chromadb
+        from chromadb.config import Settings as ChromaSettings
+
         _chroma_client = chromadb.PersistentClient(
             path=settings.chroma_persist_directory,
             settings=ChromaSettings(anonymized_telemetry=False),
@@ -28,53 +62,37 @@ def get_chroma_client() -> chromadb.PersistentClient:
     return _chroma_client
 
 
-def get_embedding_model() -> SentenceTransformer:
-    """
-    Loads all-MiniLM-L6-v2 locally.
-    First call downloads ~80MB model to ~/.cache/huggingface.
-    Every subsequent call loads from cache instantly.
-    """
-    global _embedding_model
+def get_embedding_model() -> Any:
+    global _embedding_model, _embedding_model_error
+    if _embedding_model_error is not None:
+        raise RuntimeError(f"Embedding model unavailable: {_embedding_model_error}")
     if _embedding_model is None:
+        from sentence_transformers import SentenceTransformer
+
         print(f"[Database] Loading embedding model: {settings.embedding_model}")
-        _embedding_model = SentenceTransformer(settings.embedding_model)
+        try:
+            _embedding_model = SentenceTransformer(settings.embedding_model, local_files_only=True)
+        except TypeError:
+            _embedding_model = SentenceTransformer(settings.embedding_model)
+        except Exception as exc:
+            _embedding_model_error = exc
+            raise
         print("[Database] Embedding model ready.")
     return _embedding_model
 
 
-def get_collection() -> chromadb.Collection:
-    """
-    Gets or creates the main property collection.
-    ChromaDB stores documents + embeddings + metadata together.
-    We use cosine similarity — best for semantic text search.
-    """
+def get_collection() -> Any:
     client = get_chroma_client()
-    collection = client.get_or_create_collection(
+    return client.get_or_create_collection(
         name=settings.chroma_collection_name,
         metadata={"hnsw:space": "cosine"},
     )
-    return collection
 
 
 def add_property(record: PropertyRecord) -> None:
-    """
-    Embeds a property description and stores it in ChromaDB.
-
-    WHY embed only the description:
-    The description is natural language — rich semantic content.
-    Structured fields (price, city, type) go into metadata for
-    exact filtering BEFORE the vector search runs. This is the
-    correct hybrid search pattern.
-    """
     model = get_embedding_model()
     collection = get_collection()
-
     embedding = model.encode(record.description).tolist()
-
-    # Safe fallback conversions for metadata properties
-    avg_price = float(record.avg_price_usd) if record.avg_price_usd is not None else 0.0
-    rating = float(record.star_rating) if record.star_rating is not None else 0.0
-
     collection.upsert(
         ids=[record.property_id],
         embeddings=[embedding],
@@ -82,111 +100,21 @@ def add_property(record: PropertyRecord) -> None:
         metadatas=[{
             "property_id": str(record.property_id),
             "name": str(record.name),
-            "property_type": str(record.property_type.value),
-            "city": str(record.city).lower().strip(),
-            "country": str(record.country).lower().strip(),
+            "property_type": record.property_type.value,
+            "city": record.city.lower().strip(),
+            "country": record.country.lower().strip(),
             "latitude": float(record.latitude),
             "longitude": float(record.longitude),
             "source_url": str(record.source_url),
             "amenities": json.dumps(record.amenities),
-            "avg_price_usd": avg_price,
-            "star_rating": rating,
+            "avg_price_usd": float(record.avg_price_usd) if record.avg_price_usd is not None else 0.0,
+            "star_rating": float(record.star_rating) if record.star_rating is not None else 0.0,
         }],
     )
 
 
-def search_properties(
-    query: str,
-    city_filter: Optional[str] = None,
-    property_type_filter: Optional[str] = None,
-    max_price_filter: Optional[float] = None,
-    n_results: int = 5,
-) -> list[dict]:
-    """
-    Semantic vector search with optional pre-filters.
-
-    HOW IT WORKS:
-    1. Embed the user query into a vector using the same model used at index time.
-    2. ChromaDB finds the n_results most semantically similar property descriptions.
-    3. Optional where filters narrow results BEFORE vector search (faster + cheaper).
-    """
-    model = get_embedding_model()
-    collection = get_collection()
-
-    # Defensively handle empty or missing search queries
-    if not query or not query.strip():
-        query = "comfortable stay holiday location"
-
-    query_embedding = model.encode(query).tolist()
-
-    # Build metadata filter mapping dynamically
-    where_filter = {}
-    and_conditions = []
-
-    if city_filter and city_filter.strip():
-        and_conditions.append({"city": {"$eq": city_filter.lower().strip()}})
-    
-    if property_type_filter and property_type_filter.strip():
-        and_conditions.append({"property_type": {"$eq": property_type_filter.lower().strip()}})
-
-    # If multiple conditions exist, wrap them in a valid Chroma logical dictionary structure
-    if len(and_conditions) > 1:
-        where_filter = {"$and": and_conditions}
-    elif len(and_conditions) == 1:
-        where_filter = and_conditions[0]
-
-    search_kwargs = {
-        "query_embeddings": [query_embedding],
-        "n_results": int(n_results),
-        "include": ["documents", "metadatas", "distances"],
-    }
-
-    if where_filter:
-        search_kwargs["where"] = where_filter
-
-    try:
-        results = collection.query(**search_kwargs)
-    except Exception as e:
-        print(f"[Database] ChromaDB query tracking exception caught: {e}")
-        return []
-
-    # Flatten ChromaDB's nested result format into clean dicts matching schema needs
-    output = []
-    if results and results.get("metadatas") and len(results["metadatas"]) > 0:
-        for i, metadata in enumerate(results["metadatas"][0]):
-            if metadata is None:
-                continue
-            
-            # Safely rebuild nested keys from documents collection matrix
-            metadata["description"] = results["documents"][0][i] if (results.get("documents") and len(results["documents"]) > 0) else ""
-            
-            # Reconstruct dynamic similarity metrics securely
-            if results.get("distances") and len(results["distances"]) > 0:
-                metadata["similarity_score"] = round(1 - results["distances"][0][i], 4)
-            else:
-                metadata["similarity_score"] = 1.0
-                
-            output.append(metadata)
-
-    return output
-
-
-def get_collection_count() -> int:
-    """Returns how many properties are stored. Useful for health checks."""
-    try:
-        return get_collection().count()
-    except Exception:
-        return 0
-
-
-def seed_sample_data() -> None:
-    """
-    Inserts sample properties so the system works immediately without scraping.
-    Run this once to populate the database for testing.
-    """
-    from backend.core.schemas import PropertyType
-
-    samples = [
+def _sample_properties() -> list[PropertyRecord]:
+    return [
         PropertyRecord(
             property_id="prop_001",
             name="Nile View Luxury Hotel",
@@ -195,7 +123,7 @@ def seed_sample_data() -> None:
             country="Egypt",
             latitude=30.0444,
             longitude=31.2357,
-            source_url="https://www.booking.com/hotel/eg/nile-view-luxury.html",
+            source_url=_property_search_url("Nile View Luxury Hotel", "Cairo"),
             amenities=["pool", "wifi", "breakfast", "gym", "river view", "spa"],
             avg_price_usd=120.0,
             star_rating=5.0,
@@ -214,7 +142,7 @@ def seed_sample_data() -> None:
             country="Egypt",
             latitude=30.0459,
             longitude=31.2624,
-            source_url="https://www.airbnb.com/rooms/12345678",
+            source_url=_property_search_url("Old Town Cairo Apartment", "Cairo"),
             amenities=["wifi", "kitchen", "washing machine", "air conditioning"],
             avg_price_usd=45.0,
             star_rating=4.2,
@@ -222,7 +150,26 @@ def seed_sample_data() -> None:
                 "A charming 2-bedroom apartment in the heart of Islamic Cairo. "
                 "Fully equipped kitchen, fast wifi, and authentic local feel. "
                 "Steps from Al-Azhar mosque and the historic bazaars. "
-                "Ideal for budget-conscious travelers who want an authentic Cairo experience."
+                "Ideal for budget-conscious travelers wanting an authentic Cairo experience."
+            ),
+        ),
+        PropertyRecord(
+            property_id="prop_008",
+            name="Giza Pyramids View Inn",
+            property_type=PropertyType.HOTEL,
+            city="Cairo",
+            country="Egypt",
+            latitude=29.9773,
+            longitude=31.1325,
+            source_url=_property_search_url("Giza Pyramids View Inn", "Giza"),
+            amenities=["wifi", "breakfast", "pyramids view", "rooftop terrace", "airport shuttle"],
+            avg_price_usd=85.0,
+            star_rating=4.3,
+            description=(
+                "A comfortable hotel-style stay in Giza near the Great Pyramids and the Sphinx. "
+                "Features rooftop terrace views of the pyramids, breakfast, wifi, and easy access "
+                "to the Giza Plateau. Ideal for travelers who want to stay close to Egypt's "
+                "most famous ancient landmarks."
             ),
         ),
         PropertyRecord(
@@ -233,14 +180,14 @@ def seed_sample_data() -> None:
             country="Egypt",
             latitude=29.2032,
             longitude=25.5194,
-            source_url="https://www.booking.com/hotel/eg/sahara-desert-chalet.html",
+            source_url=_property_search_url("Sahara Desert Chalet", "Siwa"),
             amenities=["wifi", "desert view", "private pool", "all-inclusive", "camel tours"],
             avg_price_usd=200.0,
             star_rating=4.8,
             description=(
                 "An exclusive eco-chalet on the edge of the Sahara Desert in Siwa Oasis. "
-                "Private plunge pool, stunning sand dune views, and all-inclusive meals featuring "
-                "local Siwan cuisine. Offers guided camel tours, sandboarding, and stargazing. "
+                "Private plunge pool, stunning sand dune views, all-inclusive meals. "
+                "Guided camel tours, sandboarding, and stargazing available. "
                 "Perfect for adventurous travelers seeking a unique luxury desert escape."
             ),
         ),
@@ -252,15 +199,15 @@ def seed_sample_data() -> None:
             country="Egypt",
             latitude=27.2579,
             longitude=33.8116,
-            source_url="https://www.airbnb.com/rooms/87654321",
+            source_url=_property_search_url("Red Sea Beach Villa", "Hurghada"),
             amenities=["private beach", "pool", "wifi", "snorkeling gear", "bbq", "sea view"],
             avg_price_usd=350.0,
             star_rating=4.9,
             description=(
                 "A stunning beachfront villa on the Red Sea coast in Hurghada. "
-                "Private beach access, infinity pool, and world-class snorkeling right off the shore. "
-                "Sleeps up to 8 guests. Fully staffed with a private chef and housekeeper. "
-                "Ideal for families or groups wanting a premium Red Sea holiday experience."
+                "Private beach access, infinity pool, world-class snorkeling. "
+                "Sleeps up to 8 guests with private chef and housekeeper. "
+                "Ideal for families or groups wanting a premium Red Sea holiday."
             ),
         ),
         PropertyRecord(
@@ -271,15 +218,15 @@ def seed_sample_data() -> None:
             country="Egypt",
             latitude=25.6872,
             longitude=32.6396,
-            source_url="https://www.booking.com/hotel/eg/luxor-heritage.html",
+            source_url=EXACT_PROPERTY_URLS["prop_005"],
             amenities=["wifi", "rooftop terrace", "breakfast", "nile view", "temple tours"],
             avg_price_usd=65.0,
             star_rating=4.5,
             description=(
                 "A beautifully restored heritage guesthouse overlooking the Nile in Luxor. "
-                "Rooftop terrace with direct views of the Luxor Temple. Complimentary breakfast "
-                "and guided temple tours available. Walking distance to Karnak Temple and the "
-                "Valley of the Kings ferry. Perfect for history lovers and culture travelers."
+                "Rooftop terrace with direct views of Luxor Temple, complimentary breakfast. "
+                "Walking distance to Karnak Temple and Valley of the Kings ferry. "
+                "Perfect for history lovers and culture travelers."
             ),
         ),
         PropertyRecord(
@@ -290,20 +237,292 @@ def seed_sample_data() -> None:
             country="Egypt",
             latitude=27.9158,
             longitude=34.3299,
-            source_url="https://www.booking.com/hotel/eg/sharm-resort.html",
+            source_url=_property_search_url("Sharm El Sheikh Resort Hotel", "Sharm El Sheikh"),
             amenities=["pool", "wifi", "all-inclusive", "diving center", "kids club", "beach"],
             avg_price_usd=180.0,
             star_rating=5.0,
             description=(
-                "A world-class all-inclusive 5-star resort in Sharm El Sheikh on the Red Sea. "
-                "Multiple pools, private beach, PADI certified diving center, and a full kids club. "
-                "All meals and drinks included. Renowned for incredible coral reef snorkeling. "
-                "Ideal for families, divers, and couples seeking a complete beach resort experience."
+                "A world-class all-inclusive 5-star resort in Sharm El Sheikh. "
+                "Multiple pools, private beach, PADI certified diving center, full kids club. "
+                "All meals and drinks included, incredible coral reef snorkeling. "
+                "Ideal for families, divers, and couples seeking a complete beach resort."
+            ),
+        ),
+        PropertyRecord(
+            property_id="prop_007",
+            name="Dahab Lagoon Dive Camp",
+            property_type=PropertyType.HOTEL,
+            city="Dahab",
+            country="Egypt",
+            latitude=28.5097,
+            longitude=34.5134,
+            source_url=_property_search_url("Dahab Lagoon Dive Camp", "Dahab"),
+            amenities=["wifi", "breakfast", "diving center", "beach", "lagoon view"],
+            avg_price_usd=75.0,
+            star_rating=4.4,
+            description=(
+                "A relaxed beachside stay near Dahab Lagoon with a diving center, breakfast, "
+                "wifi, and easy access to snorkeling spots. Great for solo travelers, divers, "
+                "and couples looking for a laid-back Red Sea base."
             ),
         ),
     ]
 
+
+def _property_search_url(name: str, city: str) -> str:
+    query = quote_plus(f"{name}, {city}, Egypt")
+    return f"https://www.booking.com/searchresults.html?ss={query}"
+
+
+def _record_to_search_result(record: PropertyRecord, similarity_score: float = 0.0) -> dict:
+    return {
+        "property_id": record.property_id,
+        "name": record.name,
+        "property_type": record.property_type.value,
+        "city": record.city.lower(),
+        "country": record.country.lower(),
+        "latitude": record.latitude,
+        "longitude": record.longitude,
+        "source_url": record.source_url,
+        "amenities": json.dumps(record.amenities),
+        "avg_price_usd": record.avg_price_usd or 0.0,
+        "star_rating": record.star_rating or 0.0,
+        "description": record.description,
+        "similarity_score": similarity_score,
+    }
+
+
+def _normalize_city_filter(city_filter: Optional[str]) -> Optional[str]:
+    if not city_filter:
+        return None
+    normalized = re.sub(r"[^a-z\s-]", " ", city_filter.lower())
+    normalized = re.sub(r"\begypt\b", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if normalized in CITY_ALIASES:
+        return CITY_ALIASES[normalized]
+    for alias, city in CITY_ALIASES.items():
+        if alias in normalized:
+            return city
+    return None
+
+
+def _normalize_property_type_filter(property_type_filter: Optional[str]) -> Optional[str]:
+    if not property_type_filter:
+        return None
+    normalized = re.sub(r"[^a-z\s-]", " ", property_type_filter.lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if normalized in PROPERTY_TYPE_ALIASES:
+        return PROPERTY_TYPE_ALIASES[normalized]
+    for alias, property_type in PROPERTY_TYPE_ALIASES.items():
+        if alias in normalized:
+            return property_type
+    return None
+
+
+def _keyword_search_properties(
+    query: str,
+    city_filter: Optional[str],
+    property_type_filter: Optional[str],
+    max_price_filter: Optional[float],
+    n_results: int,
+) -> list[dict]:
+    city_filter = _normalize_city_filter(city_filter)
+    property_type_filter = _normalize_property_type_filter(property_type_filter)
+    terms = set(re.findall(r"[a-z0-9]+", query.lower()))
+    output = []
+    for record in _sample_properties():
+        if city_filter and record.city.lower() != city_filter:
+            continue
+        if property_type_filter and record.property_type.value != property_type_filter:
+            continue
+        if (
+            max_price_filter is not None
+            and record.avg_price_usd is not None
+            and record.avg_price_usd > max_price_filter
+        ):
+            continue
+
+        haystack = " ".join([
+            record.name,
+            record.property_type.value,
+            record.city,
+            record.country,
+            " ".join(record.amenities),
+            record.description,
+        ]).lower()
+        matched_terms = sum(1 for term in terms if term in haystack)
+        exact_bonus = 3 if city_filter and record.city.lower() == city_filter else 0
+        type_bonus = (
+            2
+            if property_type_filter and record.property_type.value == property_type_filter
+            else 0
+        )
+        score = matched_terms + exact_bonus + type_bonus
+        if score > 0 or city_filter or property_type_filter:
+            output.append((score, record))
+
+    output.sort(key=lambda item: (item[0], item[1].star_rating or 0), reverse=True)
+    return [
+        _record_to_search_result(record, similarity_score=score / max(len(terms), 1))
+        for score, record in output[:n_results]
+    ]
+
+
+def _keyword_search_with_relaxation(
+    query: str,
+    city_filter: Optional[str],
+    property_type_filter: Optional[str],
+    max_price_filter: Optional[float],
+    n_results: int,
+) -> list[dict]:
+    attempts = [
+        (city_filter, property_type_filter, max_price_filter),
+        (city_filter, None, max_price_filter),
+        (city_filter, property_type_filter, None),
+        (city_filter, None, None),
+        (None, property_type_filter, max_price_filter),
+        (None, property_type_filter, None),
+        (None, None, max_price_filter),
+        (None, None, None),
+    ]
+    seen_attempts = set()
+    seen_properties = set()
+    output = []
+    for index, attempt in enumerate(attempts):
+        if attempt in seen_attempts:
+            continue
+        seen_attempts.add(attempt)
+        results = _keyword_search_properties(query, *attempt, n_results)
+        if index == 0 and len(results) >= min(2, n_results):
+            return results
+        for result in results:
+            property_id = result["property_id"]
+            if property_id in seen_properties:
+                continue
+            seen_properties.add(property_id)
+            output.append(result)
+            if len(output) >= n_results:
+                return output
+    return output
+
+
+def _supplement_with_relaxed_results(
+    output: list[dict],
+    query: str,
+    city_filter: Optional[str],
+    property_type_filter: Optional[str],
+    max_price_filter: Optional[float],
+    n_results: int,
+) -> list[dict]:
+    if len(output) >= n_results:
+        return output
+
+    seen_properties = {result["property_id"] for result in output}
+    relaxed_results = _keyword_search_with_relaxation(
+        query, city_filter, property_type_filter, max_price_filter, n_results
+    )
+    for result in relaxed_results:
+        property_id = result["property_id"]
+        if property_id in seen_properties:
+            continue
+        output.append(result)
+        seen_properties.add(property_id)
+        if len(output) >= n_results:
+            break
+    return output
+
+
+def _build_where_filter(
+    city_filter: Optional[str],
+    property_type_filter: Optional[str],
+    max_price_filter: Optional[float],
+) -> dict:
+    clauses = []
+    if city_filter:
+        clauses.append({"city": {"$eq": city_filter}})
+    if property_type_filter:
+        clauses.append({"property_type": {"$eq": property_type_filter}})
+    if max_price_filter is not None:
+        clauses.append({"avg_price_usd": {"$lte": float(max_price_filter)}})
+    if len(clauses) == 1:
+        return clauses[0]
+    if len(clauses) > 1:
+        return {"$and": clauses}
+    return {}
+
+
+def search_properties(
+    query: str,
+    city_filter: Optional[str] = None,
+    property_type_filter: Optional[str] = None,
+    max_price_filter: Optional[float] = None,
+    n_results: int = 5,
+    prefer_keyword: bool = False,
+) -> list[dict]:
+    if not query or not query.strip():
+        query = "comfortable stay holiday location"
+
+    city_filter = _normalize_city_filter(city_filter)
+    property_type_filter = _normalize_property_type_filter(property_type_filter)
+
+    if prefer_keyword or city_filter or property_type_filter or max_price_filter is not None:
+        return _keyword_search_with_relaxation(
+            query, city_filter, property_type_filter, max_price_filter, n_results
+        )
+
+    collection = get_collection()
+    try:
+        model = get_embedding_model()
+        query_embedding = model.encode(query).tolist()
+    except Exception as exc:
+        print(f"[Database] Embedding search unavailable; using keyword fallback: {exc}")
+        return _keyword_search_with_relaxation(
+            query, city_filter, property_type_filter, max_price_filter, n_results
+        )
+
+    where_filter = _build_where_filter(city_filter, property_type_filter, max_price_filter)
+
+    search_kwargs = {
+        "query_embeddings": [query_embedding],
+        "n_results": n_results,
+        "include": ["documents", "metadatas", "distances"],
+    }
+    if where_filter:
+        search_kwargs["where"] = where_filter
+
+    try:
+        results = collection.query(**search_kwargs)
+    except Exception as exc:
+        print(f"[Database] Chroma query failed; using keyword fallback: {exc}")
+        return _keyword_search_with_relaxation(
+            query, city_filter, property_type_filter, max_price_filter, n_results
+        )
+
+    output = []
+    if results and results["metadatas"]:
+        for i, metadata in enumerate(results["metadatas"][0]):
+            metadata["description"] = results["documents"][0][i]
+            metadata["similarity_score"] = 1 - results["distances"][0][i]
+            output.append(metadata)
+    if not output:
+        return _keyword_search_with_relaxation(
+            query, city_filter, property_type_filter, max_price_filter, n_results
+        )
+    return _supplement_with_relaxed_results(
+        output, query, city_filter, property_type_filter, max_price_filter, n_results
+    )
+
+
+def get_collection_count() -> int:
+    try:
+        return get_collection().count()
+    except Exception:
+        return 0
+
+
+def seed_sample_data() -> None:
+    samples = _sample_properties()
     print(f"[Database] Seeding {len(samples)} sample properties...")
     for record in samples:
         add_property(record)
-    print(f"[Database] Done. Collection now has {get_collection_count()} properties.")
+    print(f"[Database] Done. Collection has {get_collection_count()} properties.")

@@ -1,96 +1,98 @@
+# backend/agents/data_cleaner.py
 import json
+import re
 import logging
 from datetime import datetime, timezone
 import ollama
 
 from backend.core.config import settings
-from backend.core.schemas import LivePriceData
+from backend.core.schemas import LivePriceData, RawHydrationData, ScrapeStatus
 
 logger = logging.getLogger(__name__)
 
+
 class DataCleaner:
     """
-    Agent 2: Local AI Cleaner. Parses compressed web markup into structured JSON 
-    matching the exact LivePriceData contract, running entirely locally via Ollama.
+    Agent 2: Local Phi-3 Mini parses compressed HTML into structured price data.
+    Runs entirely locally via Ollama — zero API cost.
     """
+
     def __init__(self):
         self.model = settings.ollama_cleaner_model
-        # FIX: Changed base_url= to host= to match the Ollama SDK contract
-        self.client = ollama.AsyncClient(host=settings.ollama_base_url)
 
-    async def clean(self, property_id: str, compressed_html: str) -> LivePriceData:
+    async def clean(self, raw_data: RawHydrationData) -> LivePriceData:
         """
-        Processes unformatted token-optimized text blocks and extracts critical metrics.
-        Instructs the local LLM to output valid JSON text only.
+        Accepts RawHydrationData, extracts price/availability, returns LivePriceData.
         """
-        logger.info(f"Agent 2 parsing extraction payloads for property: {property_id}")
+        property_id = raw_data.property_id
+        compressed_html = raw_data.compressed_html
+        logger.info(f"[DataCleaner] Parsing property: {property_id}")
 
-        if "[ERROR]" in compressed_html:
-            logger.warning(f"Skipping LLM parsing due to upstream scraper failure: {compressed_html}")
+        # If scraper flagged a structure change or error, skip inference
+        if raw_data.scrape_status in (ScrapeStatus.STRUCTURE_CHANGED, ScrapeStatus.FAILED):
             return LivePriceData(
                 property_id=property_id,
-                scrape_timestamp=datetime.now(timezone.utc).isoformat(),
-                is_available=False,
-                availability_notes=f"Data collection error encountered: {compressed_html}"
+                scrape_timestamp=raw_data.scrape_timestamp,
+                scrape_status=raw_data.scrape_status,
             )
 
-        system_prompt = (
-            "You are an expert data parsing assistant. Your task is to extract property details "
-            "from the clean text block provided and return a single, strictly compliant JSON object. "
-            "Do not include any chat commentary, introduction, or markdown wraps (like ```json). "
-            "\n\nExpected JSON Structure fields:\n"
-            "{\n"
-            '  "nightly_price_usd": float or null,\n'
-            '  "total_price_usd": float or null,\n'
-            '  "currency_original": string or null,\n'
-            '  "cleaning_fee_usd": float or null,\n'
-            '  "is_available": boolean or null,\n'
-            '  "availability_notes": string or null\n'
-            "}\n\n"
-            "Rules:\n"
-            "1. Extract the primary or currently active price per night listed.\n"
-            "2. If prices are mentioned in other currencies (like EUR or EGP), convert roughly to USD or map original if distinct.\n"
-            "3. If explicitly sold out, flag is_available as false."
-        )
+        if not compressed_html or "[ERROR]" in compressed_html:
+            return LivePriceData(
+                property_id=property_id,
+                scrape_timestamp=raw_data.scrape_timestamp,
+                scrape_status=ScrapeStatus.FAILED,
+                availability_notes=compressed_html,
+            )
 
-        user_content = f"Target Document Body:\n{compressed_html}"
+        prompt = f"""
+You are a data extraction assistant. Extract pricing and availability from booking website text.
+Return ONLY valid JSON. No explanation. No markdown. No backticks.
 
+Text:
+{compressed_html[:6000]}
+
+Return exactly:
+{{
+  "nightly_price_usd": number or null,
+  "total_price_usd": number or null,
+  "currency_original": "USD or EUR or EGP etc or null",
+  "cleaning_fee_usd": number or null,
+  "is_available": true or false or null,
+  "availability_notes": "any availability text or null"
+}}
+
+Rules:
+- Convert non-USD prices approximately to USD
+- is_available is false if: sold out, unavailable, no rooms, fully booked
+- is_available is true if: available, book now, reserve, per night
+- All numbers are plain numerics, no currency symbols
+- null for anything not found
+"""
         try:
-            # Call local Ollama runtime asynchronously
-            response = await self.client.generate(
+            response = ollama.chat(
                 model=self.model,
-                system=system_prompt,
-                prompt=user_content,
-                options={"temperature": 0.0}  # Hard deterministic parsing constraints
+                messages=[{"role": "user", "content": prompt}],
+                options={"temperature": 0.0},
             )
+            raw_text = response["message"]["content"].strip()
+            raw_text = re.sub(r"```json|```", "", raw_text).strip()
+            extracted = json.loads(raw_text)
 
-            response_text = response.get("response", "").strip()
-            
-            # Clean up accidental markdown wraps if the local model appended them anyway
-            if response_text.startswith("```"):
-                response_text = response_text.strip("`").replace("json", "", 1).strip()
-
-            # OPTIMIZATION: Parse and validate directly using Pydantic's native engine.
-            # This handles missing fields, conversions, and validation logic instantly.
-            live_data = LivePriceData.model_validate_json(response_text)
-            
-            # Inject dynamic runtime properties using model_copy
-            return live_data.model_copy(update={
-                "property_id": property_id,
-                "scrape_timestamp": datetime.now(timezone.utc).isoformat()
-            })
-
-        except (json.JSONDecodeError, ValueError) as je:
-            logger.error(f"Ollama output did not return structured valid JSON: {str(je)}. Text: {response_text}")
-            return self._generate_fallback_data(property_id, f"JSON structural interpretation failure: {str(je)}")
+            return LivePriceData(
+                property_id=property_id,
+                nightly_price_usd=extracted.get("nightly_price_usd"),
+                total_price_usd=extracted.get("total_price_usd"),
+                currency_original=extracted.get("currency_original"),
+                cleaning_fee_usd=extracted.get("cleaning_fee_usd"),
+                is_available=extracted.get("is_available"),
+                availability_notes=extracted.get("availability_notes"),
+                scrape_timestamp=raw_data.scrape_timestamp,
+                scrape_status=ScrapeStatus.SUCCESS,
+            )
         except Exception as e:
-            logger.error(f"Agent 2 extraction runtime failure for {property_id}: {str(e)}")
-            return self._generate_fallback_data(property_id, f"Extraction engine exception: {str(e)}")
-
-    def _generate_fallback_data(self, property_id: str, reason: str) -> LivePriceData:
-        return LivePriceData(
-            property_id=property_id,
-            scrape_timestamp=datetime.now(timezone.utc).isoformat(),
-            is_available=None,
-            availability_notes=f"Fallback triggered: {reason}"
-        )
+            logger.error(f"[DataCleaner] Failed for {property_id}: {e}")
+            return LivePriceData(
+                property_id=property_id,
+                scrape_timestamp=raw_data.scrape_timestamp,
+                scrape_status=ScrapeStatus.FAILED,
+            )
